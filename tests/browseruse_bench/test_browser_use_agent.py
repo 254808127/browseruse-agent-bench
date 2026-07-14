@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -166,6 +167,327 @@ def test_browser_use_browser_rewrites_sdk_cdp_timeout_message(
 
     with pytest.raises(RuntimeError, match="timed out after 30s"):
         asyncio.run(browser.start())
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        browser_use_module._BROWSER_USE_DIAG_ENV,
+        browser_use_module._BROWSER_USE_CDP_LIVENESS_ENV,
+    ],
+)
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE"])
+def test_browser_use_diagnostics_accept_enabled_env_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    value: str,
+) -> None:
+    monkeypatch.delenv(browser_use_module._BROWSER_USE_DIAG_ENV, raising=False)
+    monkeypatch.delenv(browser_use_module._BROWSER_USE_CDP_LIVENESS_ENV, raising=False)
+    monkeypatch.setenv(env_name, value)
+
+    assert browser_use_module._browser_use_diagnostics_enabled() is True
+
+
+def test_browser_use_full_diagnostics_does_not_enable_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(browser_use_module._BROWSER_USE_DIAG_ENV, "1")
+    monkeypatch.delenv(browser_use_module._BROWSER_USE_CDP_LIVENESS_ENV, raising=False)
+
+    assert browser_use_module._browser_use_diag_enabled() is True
+    assert browser_use_module._browser_use_cdp_liveness_enabled() is False
+
+
+def test_browser_use_diagnostics_are_not_installed_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.delenv(browser_use_module._BROWSER_USE_DIAG_ENV, raising=False)
+    monkeypatch.delenv(browser_use_module._BROWSER_USE_CDP_LIVENESS_ENV, raising=False)
+    monkeypatch.setattr(
+        browser_use_module,
+        "_patch_browser_use_cdp_diagnostics",
+        lambda: calls.append("cdp"),
+    )
+    monkeypatch.setattr(
+        browser_use_module,
+        "_patch_browser_use_frame_diagnostics",
+        lambda: calls.append("frame"),
+    )
+
+    browser_use_module._install_browser_use_diagnostics()
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("env_name", "expected_calls"),
+    [
+        (browser_use_module._BROWSER_USE_DIAG_ENV, ["cdp"]),
+        (browser_use_module._BROWSER_USE_CDP_LIVENESS_ENV, ["cdp", "frame"]),
+    ],
+)
+def test_browser_use_diagnostic_flag_installs_required_patches(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    expected_calls: list[str],
+) -> None:
+    calls: list[str] = []
+    monkeypatch.delenv(browser_use_module._BROWSER_USE_DIAG_ENV, raising=False)
+    monkeypatch.delenv(browser_use_module._BROWSER_USE_CDP_LIVENESS_ENV, raising=False)
+    monkeypatch.setenv(env_name, "1")
+    monkeypatch.setattr(
+        browser_use_module,
+        "_patch_browser_use_cdp_diagnostics",
+        lambda: calls.append("cdp"),
+    )
+    monkeypatch.setattr(
+        browser_use_module,
+        "_patch_browser_use_frame_diagnostics",
+        lambda: calls.append("frame"),
+    )
+
+    browser_use_module._install_browser_use_diagnostics()
+
+    assert calls == expected_calls
+
+
+def test_browser_use_liveness_latency_summary_uses_nearest_rank() -> None:
+    samples = [133.0, 56.8, 58.0, 59.6, 57.4]
+
+    assert browser_use_module._latency_summary_ms(samples) == {
+        "count": 5,
+        "min": 56.8,
+        "p50": 58.0,
+        "p95": 133.0,
+        "max": 133.0,
+    }
+
+
+def test_browser_use_cdp_diagnostics_track_active_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeCDPClient:
+        def __init__(self) -> None:
+            self.msg_id = 0
+            self.ws = object()
+            self.pending_requests: dict[int, asyncio.Future[dict[str, Any]]] = {}
+
+        async def send_raw(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+            session_id: str | None = None,
+        ) -> dict[str, Any]:
+            del method, params, session_id
+            self.msg_id += 1
+            request_started.set()
+            await release_request.wait()
+            return {}
+
+    async def run_request() -> None:
+        nonlocal request_started, release_request
+        request_started = asyncio.Event()
+        release_request = asyncio.Event()
+        client = _FakeCDPClient()
+        task = asyncio.create_task(
+            client.send_raw(
+                "DOM.getFrameOwner",
+                params={"frameId": "frame-1"},
+                session_id="session-12345678",
+            )
+        )
+        await asyncio.wait_for(request_started.wait(), timeout=1.0)
+        assert browser_use_module._active_cdp_requests(client) == [
+            {"id": 1, "method": "DOM.getFrameOwner", "session": "12345678"}
+        ]
+        release_request.set()
+        await task
+        assert browser_use_module._active_cdp_requests(client) == []
+
+    request_started: asyncio.Event
+    release_request: asyncio.Event
+    monkeypatch.setenv(browser_use_module._BROWSER_USE_CDP_LIVENESS_ENV, "1")
+    monkeypatch.setattr(browser_use_module, "CDPClient", _FakeCDPClient)
+    browser_use_module._patch_browser_use_cdp_diagnostics()
+
+    asyncio.run(run_request())
+
+
+def test_browser_use_frame_diagnostics_scope_probe_to_get_all_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phases: list[tuple[str, str]] = []
+
+    class _FakeBrowserSession:
+        def __init__(self) -> None:
+            self._browseruse_bench_frame_phase = "before"
+
+        async def _cdp_get_all_pages(self) -> list[dict[str, Any]]:
+            phases.append(("targets", self._browseruse_bench_frame_phase))
+            await asyncio.sleep(0)
+            return []
+
+        async def _populate_frame_metadata(
+            self,
+            all_frames: dict[str, dict[str, Any]],
+            target_sessions: dict[str, str],
+        ) -> None:
+            del all_frames, target_sessions
+            phases.append(("metadata", self._browseruse_bench_frame_phase))
+
+        async def get_all_frames(self) -> tuple[dict[str, Any], dict[str, str]]:
+            await self._cdp_get_all_pages()
+            await self._populate_frame_metadata({}, {})
+            return {}, {}
+
+    async def run_get_all_frames() -> None:
+        nonlocal probe_cancelled
+        probe_cancelled = asyncio.Event()
+
+        async def fake_probe(session: Any) -> None:
+            phases.append(("probe", session._browseruse_bench_frame_phase))
+            try:
+                await asyncio.Event().wait()
+            finally:
+                probe_cancelled.set()
+
+        monkeypatch.setattr(
+            browser_use_module,
+            "_run_browser_use_cdp_liveness_probe",
+            fake_probe,
+        )
+        browser_use_module._patch_browser_use_frame_diagnostics()
+        session = _FakeBrowserSession()
+
+        assert await session.get_all_frames() == ({}, {})
+        assert probe_cancelled.is_set()
+        assert session._browseruse_bench_frame_phase == "before"
+
+    probe_cancelled: asyncio.Event
+    monkeypatch.setenv(browser_use_module._BROWSER_USE_CDP_LIVENESS_ENV, "1")
+    monkeypatch.setattr(browser_use_module, "BrowserSession", _FakeBrowserSession)
+
+    asyncio.run(run_get_all_frames())
+
+    assert ("targets", "target_discovery") in phases
+    assert ("metadata", "metadata") in phases
+    assert any(name == "probe" for name, _phase in phases)
+
+
+def test_browser_use_liveness_heavy_bundle_overtakes_pending_request(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample_sent = asyncio.Event()
+    calls: list[tuple[str, dict[str, Any] | None, str | None]] = []
+
+    class _FakeCDPClient:
+        ws = object()
+
+        def __init__(self) -> None:
+            setattr(
+                self,
+                browser_use_module._BROWSER_USE_CDP_ACTIVE_REQUESTS_ATTR,
+                {41: {"method": "DOM.getFrameOwner", "session_id": "session-12345678"}},
+            )
+
+        async def send_raw(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+            session_id: str | None = None,
+        ) -> dict[str, Any]:
+            calls.append((method, params, session_id))
+            if len(calls) == len(browser_use_module._BROWSER_USE_CDP_LIVENESS_METHODS):
+                sample_sent.set()
+
+            if method == "Accessibility.getFullAXTree":
+                return {"nodes": [{}, {}]}
+            if method == "DOMSnapshot.captureSnapshot":
+                return {"documents": [{}], "strings": ["a", "b", "c"]}
+            if method == "DOM.getDocument":
+                return {"root": {"nodeId": 7, "childNodeCount": 3}}
+            raise AssertionError(f"Unexpected probe method: {method}")
+
+    class _FakeBrowserSession:
+        def __init__(self) -> None:
+            self.cdp_client = _FakeCDPClient()
+            self.agent_focus_target_id = "target-12345678"
+            self._browseruse_bench_frame_phase = "metadata"
+
+        async def get_or_create_cdp_session(
+            self,
+            target_id: str,
+            focus: bool,
+        ) -> SimpleNamespace:
+            assert target_id == self.agent_focus_target_id
+            assert focus is False
+            return SimpleNamespace(
+                cdp_client=self.cdp_client,
+                session_id="probe-session-87654321",
+            )
+
+    async def run_probe() -> None:
+        session = _FakeBrowserSession()
+        task = asyncio.create_task(browser_use_module._run_browser_use_cdp_liveness_probe(session))
+        await asyncio.wait_for(sample_sent.wait(), timeout=1.0)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    monkeypatch.setattr(browser_use_module, "_BROWSER_USE_CDP_LIVENESS_INTERVAL_SECONDS", 60.0)
+    caplog.set_level(logging.INFO, logger=browser_use_module.__name__)
+
+    asyncio.run(run_probe())
+
+    assert [method for method, _params, _session_id in calls] == list(
+        browser_use_module._BROWSER_USE_CDP_LIVENESS_METHODS
+    )
+    assert {session_id for _method, _params, session_id in calls} == {"probe-session-87654321"}
+    params_by_method = {method: params for method, params, _session_id in calls}
+    assert params_by_method["Accessibility.getFullAXTree"] is None
+    assert params_by_method["DOMSnapshot.captureSnapshot"] == {
+        "computedStyles": browser_use_module.BROWSER_USE_REQUIRED_COMPUTED_STYLES,
+        "includePaintOrder": True,
+        "includeDOMRects": True,
+        "includeBlendedBackgroundColors": False,
+        "includeTextColorOpacities": False,
+    }
+    assert params_by_method["DOM.getDocument"] == {"depth": -1, "pierce": True}
+
+    messages = [record.getMessage() for record in caplog.records]
+    start = next(message for message in messages if "cdp-liveness] start" in message)
+    sample = next(message for message in messages if "cdp-liveness] sample=1" in message)
+    summary = next(message for message in messages if "cdp-liveness] summary" in message)
+    request_starts = [message for message in messages if "cdp-liveness-request] start" in message]
+    request_finishes = [
+        message for message in messages if "cdp-liveness-request] finish" in message
+    ]
+    assert len(request_starts) == 3
+    assert len(request_finishes) == 3
+    assert "Accessibility.getFullAXTree" in start
+    assert "DOMSnapshot.captureSnapshot" in start
+    assert "DOM.getDocument" in start
+    assert "session=87654321" in start
+    assert "root_client_match=True" in start
+    assert "phase=metadata" in sample
+    assert "bundle_rtt_ms=" in sample
+    assert "'Accessibility.getFullAXTree': {'nodes': 2}" in sample
+    assert "'DOMSnapshot.captureSnapshot': {'documents': 1, 'strings': 3}" in sample
+    assert "'DOM.getDocument': {'root_node_id': 7, 'child_node_count': 3}" in sample
+    assert "errors={}" in sample
+    assert "pending_before=['41:DOM.getFrameOwner@12345678']" in sample
+    assert "still_pending_after=['41:DOM.getFrameOwner@12345678']" in sample
+    assert "bundle_latency_ms=" in summary
+    assert "method_latency_ms=" in summary
+    assert "overlap_samples=1" in summary
+    assert "overtake_samples=1" in summary
+    assert "failed_samples=0" in summary
+    assert "failed_requests=0" in summary
 
 
 class _OutputForParserTest(BaseModel):
@@ -512,7 +834,11 @@ def test_run_task_async_tolerates_temp_dir_cleanup_error(
 
     result = asyncio.run(
         BrowserUseAgent()._run_task_async(
-            task_info={"task_id": "t-cleanup", "task_text": "open page", "url": "https://example.com"},
+            task_info={
+                "task_id": "t-cleanup",
+                "task_text": "open page",
+                "url": "https://example.com",
+            },
             task_workspace=tmp_path,
             timeout=1,
             flash_mode=False,
@@ -524,7 +850,9 @@ def test_run_task_async_tolerates_temp_dir_cleanup_error(
     assert result.env_status.value == "failed"
     assert result.agent_done.value == "error"
     assert result.error == "Agent returned no history before completion"
-    assert any("Failed to cleanup temporary directory" in record.message for record in caplog.records)
+    assert any(
+        "Failed to cleanup temporary directory" in record.message for record in caplog.records
+    )
 
 
 def test_run_task_async_maps_early_unfinished_history_to_error(
@@ -578,7 +906,11 @@ def test_run_task_async_maps_early_unfinished_history_to_error(
 
     result = asyncio.run(
         BrowserUseAgent()._run_task_async(
-            task_info={"task_id": "t-incomplete", "task_text": "search", "url": "https://example.com"},
+            task_info={
+                "task_id": "t-incomplete",
+                "task_text": "search",
+                "url": "https://example.com",
+            },
             task_workspace=tmp_path,
             timeout=600,
             flash_mode=False,
@@ -592,7 +924,10 @@ def test_run_task_async_maps_early_unfinished_history_to_error(
     assert result.agent_success is None
     assert result.metrics.steps == 4
     assert result.error == "Agent stopped before completion after 4 steps without reporting done"
-    assert result.answer == "[Task Failed: Agent stopped before completion after 4 steps without reporting done]"
+    assert (
+        result.answer
+        == "[Task Failed: Agent stopped before completion after 4 steps without reporting done]"
+    )
 
 
 def test_run_task_async_keeps_real_max_steps_status(

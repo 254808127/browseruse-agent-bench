@@ -13,8 +13,8 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,11 +29,16 @@ from browser_use import ChatGoogle as BrowserUseSDKChatGoogle
 from browser_use import ChatOpenAI as BrowserUseSDKChatOpenAI
 from browser_use.browser import session as browser_use_session_module
 from browser_use.browser.profile import ProxySettings as BrowserUseProxySettings
+from browser_use.browser.session import BrowserSession
+from browser_use.dom.enhanced_snapshot import (
+    REQUIRED_COMPUTED_STYLES as BROWSER_USE_REQUIRED_COMPUTED_STYLES,
+)
 from browser_use.llm.exceptions import ModelError as BrowserUseModelError
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.openai.responses_serializer import ResponsesAPIMessageSerializer
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
+from cdp_use.client import CDPClient
 from pydantic import BaseModel as _PydanticBaseModel
 
 from browseruse_bench.agents.base import BaseAgent
@@ -54,6 +59,18 @@ logger = logging.getLogger(__name__)
 BROWSER_USE_CDP_CONNECT_TIMEOUT_SECONDS = 30.0
 _BROWSER_USE_SDK_CDP_CONNECT_TIMEOUT_SECONDS = 15.0
 _BROWSER_USE_CDP_CONNECT_TIMEOUT_LABEL = f"{BROWSER_USE_CDP_CONNECT_TIMEOUT_SECONDS:g}s"
+_BROWSER_USE_DIAG_ENABLED_VALUES = {"1", "true", "yes", "on"}
+_BROWSER_USE_DIAG_ENV = "BUBENCH_BROWSER_USE_DIAG"
+_BROWSER_USE_CDP_DIAG_PATCHED_ATTR = "_browseruse_bench_cdp_diag_patched"
+_BROWSER_USE_FRAME_DIAG_PATCHED_ATTR = "_browseruse_bench_frame_diag_patched"
+_BROWSER_USE_CDP_ACTIVE_REQUESTS_ATTR = "_browseruse_bench_active_cdp_requests"
+_BROWSER_USE_CDP_LIVENESS_ENV = "BUBENCH_BROWSER_USE_CDP_LIVENESS_DIAG"
+_BROWSER_USE_CDP_LIVENESS_INTERVAL_SECONDS = 1.0
+_BROWSER_USE_CDP_LIVENESS_METHODS = (
+    "Accessibility.getFullAXTree",
+    "DOMSnapshot.captureSnapshot",
+    "DOM.getDocument",
+)
 
 
 _MAX_STEPS_ERROR = "Failed to complete task in maximum steps"
@@ -150,7 +167,9 @@ def _patch_output_model_json_parser(output_model: type[Any] | None) -> None:
     original_validate_json = output_model.model_validate_json.__func__
 
     @classmethod
-    def robust_model_validate_json(cls: type[Any], json_data: Any, *args: Any, **kwargs: Any) -> Any:
+    def robust_model_validate_json(
+        cls: type[Any], json_data: Any, *args: Any, **kwargs: Any
+    ) -> Any:
         try:
             return original_validate_json(cls, json_data, *args, **kwargs)
         except Exception:
@@ -532,6 +551,438 @@ def _browser_use_cdp_timeout_message(message: str) -> str:
     return message
 
 
+def _browser_use_diag_enabled() -> bool:
+    return os.getenv(_BROWSER_USE_DIAG_ENV, "").lower() in _BROWSER_USE_DIAG_ENABLED_VALUES
+
+
+def _browser_use_cdp_liveness_enabled() -> bool:
+    return os.getenv(_BROWSER_USE_CDP_LIVENESS_ENV, "").lower() in _BROWSER_USE_DIAG_ENABLED_VALUES
+
+
+def _browser_use_diagnostics_enabled() -> bool:
+    return _browser_use_diag_enabled() or _browser_use_cdp_liveness_enabled()
+
+
+def _short_id(value: Any) -> str:
+    return str(value or "")[-8:]
+
+
+def _object_id(value: Any) -> str:
+    return f"0x{id(value):x}" if value is not None else "none"
+
+
+def _active_cdp_requests(client: Any) -> list[dict[str, Any]]:
+    active = getattr(client, _BROWSER_USE_CDP_ACTIVE_REQUESTS_ATTR, None)
+    if not isinstance(active, dict):
+        return []
+
+    requests: list[dict[str, Any]] = []
+    for request_id, request in active.items():
+        if isinstance(request_id, int) and isinstance(request, dict):
+            requests.append(
+                {
+                    "id": request_id,
+                    "method": str(request.get("method") or ""),
+                    "session": _short_id(request.get("session_id")),
+                }
+            )
+    return sorted(requests, key=lambda request: request["id"])
+
+
+def _active_cdp_request_labels(requests: list[dict[str, Any]]) -> list[str]:
+    return [f"{request['id']}:{request['method']}@{request['session']}" for request in requests]
+
+
+def _latency_summary_ms(samples: list[float]) -> dict[str, float | int]:
+    if not samples:
+        return {"count": 0}
+
+    ordered = sorted(samples)
+    sample_count = len(ordered)
+    p50_index = max(0, (50 * sample_count + 99) // 100 - 1)
+    p95_index = max(0, (95 * sample_count + 99) // 100 - 1)
+    return {
+        "count": sample_count,
+        "min": round(ordered[0], 1),
+        "p50": round(ordered[p50_index], 1),
+        "p95": round(ordered[p95_index], 1),
+        "max": round(ordered[-1], 1),
+    }
+
+
+def _browser_use_cdp_liveness_requests() -> tuple[tuple[str, dict[str, Any] | None], ...]:
+    return (
+        ("Accessibility.getFullAXTree", None),
+        (
+            "DOMSnapshot.captureSnapshot",
+            {
+                "computedStyles": BROWSER_USE_REQUIRED_COMPUTED_STYLES,
+                "includePaintOrder": True,
+                "includeDOMRects": True,
+                "includeBlendedBackgroundColors": False,
+                "includeTextColorOpacities": False,
+            },
+        ),
+        ("DOM.getDocument", {"depth": -1, "pierce": True}),
+    )
+
+
+def _browser_use_cdp_liveness_response_summary(
+    method: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    if method == "Accessibility.getFullAXTree":
+        nodes = result.get("nodes")
+        return {"nodes": len(nodes) if isinstance(nodes, list) else 0}
+
+    if method == "DOMSnapshot.captureSnapshot":
+        documents = result.get("documents")
+        strings = result.get("strings")
+        return {
+            "documents": len(documents) if isinstance(documents, list) else 0,
+            "strings": len(strings) if isinstance(strings, list) else 0,
+        }
+
+    if method == "DOM.getDocument":
+        root = result.get("root")
+        if not isinstance(root, dict):
+            return {"root_node_id": "", "child_node_count": 0}
+        return {
+            "root_node_id": root.get("nodeId", ""),
+            "child_node_count": root.get("childNodeCount", 0),
+        }
+
+    return {"keys": sorted(result)}
+
+
+async def _send_browser_use_cdp_liveness_request(
+    client: Any,
+    method: str,
+    params: dict[str, Any] | None,
+    session_id: str,
+) -> tuple[str, float | None, dict[str, Any], str | None]:
+    started_at = time.perf_counter()
+    logger.info(
+        "[browser-use cdp-liveness-request] start method=%s session=%s client=%s ws=%s",
+        method,
+        _short_id(session_id),
+        _object_id(client),
+        _object_id(getattr(client, "ws", None)),
+    )
+    try:
+        result = await client.send_raw(method, params=params, session_id=session_id)
+    except asyncio.CancelledError:
+        logger.info(
+            "[browser-use cdp-liveness-request] interrupted method=%s session=%s elapsed_ms=%.1f",
+            method,
+            _short_id(session_id),
+            (time.perf_counter() - started_at) * 1000,
+        )
+        raise
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+        logger.warning(
+            "[browser-use cdp-liveness-request] error method=%s session=%s elapsed_ms=%.1f error=%s: %s",
+            method,
+            _short_id(session_id),
+            (time.perf_counter() - started_at) * 1000,
+            type(exc).__name__,
+            exc,
+        )
+        return method, None, {}, f"{type(exc).__name__}: {exc}"
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    response = result if isinstance(result, dict) else {}
+    response_summary = _browser_use_cdp_liveness_response_summary(method, response)
+    logger.info(
+        "[browser-use cdp-liveness-request] finish method=%s session=%s elapsed_ms=%.1f response=%s",
+        method,
+        _short_id(session_id),
+        elapsed_ms,
+        response_summary,
+    )
+    return method, elapsed_ms, response_summary, None
+
+
+async def _run_browser_use_cdp_liveness_probe(browser_session: Any) -> None:
+    root_client = getattr(browser_session, "cdp_client", None)
+    target_id = str(getattr(browser_session, "agent_focus_target_id", "") or "")
+    if root_client is None or not target_id:
+        logger.warning(
+            "[browser-use cdp-liveness] unavailable client=%s target=%s",
+            _object_id(root_client),
+            _short_id(target_id),
+        )
+        return
+
+    try:
+        cdp_session = await browser_session.get_or_create_cdp_session(
+            target_id=target_id,
+            focus=False,
+        )
+    except (AssertionError, RuntimeError, TimeoutError, ValueError) as exc:
+        logger.warning(
+            "[browser-use cdp-liveness] unavailable client=%s target=%s error=%s: %s",
+            _object_id(root_client),
+            _short_id(target_id),
+            type(exc).__name__,
+            exc,
+        )
+        return
+
+    client = getattr(cdp_session, "cdp_client", None)
+    session_id = str(getattr(cdp_session, "session_id", "") or "")
+    ws = getattr(client, "ws", None)
+    if client is None or ws is None or not session_id:
+        logger.warning(
+            "[browser-use cdp-liveness] unavailable client=%s ws=%s target=%s session=%s",
+            _object_id(client),
+            _object_id(ws),
+            _short_id(target_id),
+            _short_id(session_id),
+        )
+        return
+
+    method_latencies_ms: dict[str, list[float]] = {
+        method: [] for method in _BROWSER_USE_CDP_LIVENESS_METHODS
+    }
+    bundle_latencies_ms: list[float] = []
+    overlap_samples = 0
+    overtake_samples = 0
+    failed_samples = 0
+    failed_requests = 0
+    sequence = 0
+    cancelled = False
+    logger.info(
+        "[browser-use cdp-liveness] start methods=%s interval=%.1fs target=%s session=%s client=%s ws=%s root_client_match=%s",
+        list(_BROWSER_USE_CDP_LIVENESS_METHODS),
+        _BROWSER_USE_CDP_LIVENESS_INTERVAL_SECONDS,
+        _short_id(target_id),
+        _short_id(session_id),
+        _object_id(client),
+        _object_id(ws),
+        client is root_client,
+    )
+
+    try:
+        await asyncio.sleep(0.1)
+        while True:
+            sequence += 1
+            phase = str(getattr(browser_session, "_browseruse_bench_frame_phase", "unknown"))
+            active_before = _active_cdp_requests(client)
+            if active_before:
+                overlap_samples += 1
+
+            started_at = time.perf_counter()
+            results = await asyncio.gather(
+                *(
+                    _send_browser_use_cdp_liveness_request(
+                        client,
+                        method,
+                        params,
+                        session_id,
+                    )
+                    for method, params in _browser_use_cdp_liveness_requests()
+                )
+            )
+            bundle_elapsed_ms = (time.perf_counter() - started_at) * 1000
+            bundle_latencies_ms.append(bundle_elapsed_ms)
+
+            method_rtt_ms: dict[str, float] = {}
+            response_summaries: dict[str, dict[str, Any]] = {}
+            errors: dict[str, str] = {}
+            for method, elapsed_ms, response_summary, error in results:
+                if elapsed_ms is None:
+                    failed_requests += 1
+                    errors[method] = error or "unknown error"
+                    continue
+                method_latencies_ms[method].append(elapsed_ms)
+                method_rtt_ms[method] = round(elapsed_ms, 1)
+                response_summaries[method] = response_summary
+
+            if errors:
+                failed_samples += 1
+
+            active_after = _active_cdp_requests(client)
+            active_after_ids = {request["id"] for request in active_after}
+            overtaken = [request for request in active_before if request["id"] in active_after_ids]
+            if overtaken:
+                overtake_samples += 1
+            logger.info(
+                "[browser-use cdp-liveness] sample=%s phase=%s target=%s session=%s client=%s ws=%s bundle_rtt_ms=%.1f method_rtt_ms=%s responses=%s errors=%s pending_before=%s still_pending_after=%s",
+                sequence,
+                phase,
+                _short_id(target_id),
+                _short_id(session_id),
+                _object_id(client),
+                _object_id(ws),
+                bundle_elapsed_ms,
+                method_rtt_ms,
+                response_summaries,
+                errors,
+                _active_cdp_request_labels(active_before),
+                _active_cdp_request_labels(overtaken),
+            )
+
+            await asyncio.sleep(_BROWSER_USE_CDP_LIVENESS_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    finally:
+        logger.info(
+            "[browser-use cdp-liveness] summary target=%s session=%s client=%s ws=%s bundle_latency_ms=%s method_latency_ms=%s overlap_samples=%s overtake_samples=%s failed_samples=%s failed_requests=%s cancelled=%s",
+            _short_id(target_id),
+            _short_id(session_id),
+            _object_id(client),
+            _object_id(ws),
+            _latency_summary_ms(bundle_latencies_ms),
+            {
+                method: _latency_summary_ms(latencies)
+                for method, latencies in method_latencies_ms.items()
+            },
+            overlap_samples,
+            overtake_samples,
+            failed_samples,
+            failed_requests,
+            cancelled,
+        )
+
+
+def _patch_browser_use_cdp_diagnostics() -> None:
+    if getattr(CDPClient, _BROWSER_USE_CDP_DIAG_PATCHED_ATTR, False):
+        return
+
+    original_send_raw = CDPClient.send_raw
+
+    async def send_raw_with_diagnostics(
+        self: Any,
+        method: str,
+        params: Any = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not _browser_use_diagnostics_enabled():
+            return await original_send_raw(self, method, params=params, session_id=session_id)
+
+        # cdp-use increments msg_id synchronously before send_raw's first await.
+        request_id = int(getattr(self, "msg_id", 0)) + 1
+        started_at = time.perf_counter()
+        diag_enabled = _browser_use_diag_enabled()
+        client_id = _object_id(self)
+        ws_id = _object_id(getattr(self, "ws", None))
+        active_requests = getattr(self, _BROWSER_USE_CDP_ACTIVE_REQUESTS_ATTR, None)
+        if not isinstance(active_requests, dict):
+            active_requests = {}
+            setattr(self, _BROWSER_USE_CDP_ACTIVE_REQUESTS_ATTR, active_requests)
+        active_requests[request_id] = {"method": method, "session_id": session_id}
+        completed = False
+
+        if diag_enabled:
+            logger.info(
+                "[browser-use cdp] start id=%s method=%s session=%s client=%s ws=%s",
+                request_id,
+                method,
+                _short_id(session_id),
+                client_id,
+                ws_id,
+            )
+
+        try:
+            result = await original_send_raw(self, method, params=params, session_id=session_id)
+            completed = True
+            return result
+        finally:
+            elapsed = time.perf_counter() - started_at
+            active_requests.pop(request_id, None)
+            if diag_enabled:
+                logger.info(
+                    "[browser-use cdp] %s id=%s method=%s session=%s client=%s ws=%s elapsed=%.2fs",
+                    "finish" if completed else "interrupted",
+                    request_id,
+                    method,
+                    _short_id(session_id),
+                    client_id,
+                    ws_id,
+                    elapsed,
+                )
+
+    CDPClient.send_raw = send_raw_with_diagnostics
+    setattr(CDPClient, _BROWSER_USE_CDP_DIAG_PATCHED_ATTR, True)
+
+
+async def _run_in_browser_use_frame_phase(
+    browser_session: Any,
+    phase: str,
+    operation: Callable[[], Awaitable[Any]],
+) -> Any:
+    previous_phase = getattr(browser_session, "_browseruse_bench_frame_phase", None)
+    browser_session._browseruse_bench_frame_phase = phase
+    try:
+        return await operation()
+    finally:
+        browser_session._browseruse_bench_frame_phase = previous_phase
+
+
+def _patch_browser_use_frame_diagnostics() -> None:
+    if getattr(BrowserSession, _BROWSER_USE_FRAME_DIAG_PATCHED_ATTR, False):
+        return
+
+    original_get_all_frames = BrowserSession.get_all_frames
+    original_cdp_get_all_pages = BrowserSession._cdp_get_all_pages
+    original_populate_frame_metadata = BrowserSession._populate_frame_metadata
+
+    async def get_all_frames_with_diagnostics(self: Any) -> Any:
+        if not _browser_use_cdp_liveness_enabled():
+            return await original_get_all_frames(self)
+
+        previous_phase = getattr(self, "_browseruse_bench_frame_phase", None)
+        self._browseruse_bench_frame_phase = "frame_tree"
+        liveness_task = asyncio.create_task(
+            _run_browser_use_cdp_liveness_probe(self),
+            name="browser_use_cdp_liveness_probe",
+        )
+        try:
+            return await original_get_all_frames(self)
+        finally:
+            liveness_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await liveness_task
+            self._browseruse_bench_frame_phase = previous_phase
+
+    async def cdp_get_all_pages_with_diagnostics(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not _browser_use_cdp_liveness_enabled():
+            return await original_cdp_get_all_pages(self, *args, **kwargs)
+        return await _run_in_browser_use_frame_phase(
+            self,
+            "target_discovery",
+            lambda: original_cdp_get_all_pages(self, *args, **kwargs),
+        )
+
+    async def populate_frame_metadata_with_diagnostics(
+        self: Any,
+        all_frames: dict[str, dict],
+        target_sessions: dict[str, str],
+    ) -> Any:
+        if not _browser_use_cdp_liveness_enabled():
+            return await original_populate_frame_metadata(self, all_frames, target_sessions)
+        return await _run_in_browser_use_frame_phase(
+            self,
+            "metadata",
+            lambda: original_populate_frame_metadata(self, all_frames, target_sessions),
+        )
+
+    BrowserSession._cdp_get_all_pages = cdp_get_all_pages_with_diagnostics
+    BrowserSession._populate_frame_metadata = populate_frame_metadata_with_diagnostics
+    BrowserSession.get_all_frames = get_all_frames_with_diagnostics
+    setattr(BrowserSession, _BROWSER_USE_FRAME_DIAG_PATCHED_ATTR, True)
+
+
+def _install_browser_use_diagnostics() -> None:
+    if not _browser_use_diagnostics_enabled():
+        return
+    _patch_browser_use_cdp_diagnostics()
+    if _browser_use_cdp_liveness_enabled():
+        _patch_browser_use_frame_diagnostics()
+
+
 class BrowserUseBenchBrowser(BrowserUseSDKBrowser):
     """browser-use BrowserSession with benchmark-specific CDP connect timeout."""
 
@@ -578,7 +1029,9 @@ def _history_reached_max_steps(
 ) -> bool:
     if steps_count >= max_steps:
         return True
-    return any("maximum steps" in error.lower() or "max steps" in error.lower() for error in history_errors)
+    return any(
+        "maximum steps" in error.lower() or "max steps" in error.lower() for error in history_errors
+    )
 
 
 def _unfinished_history_error(
@@ -611,7 +1064,9 @@ class BrowserUseAgent(BaseAgent):
         """Execute a browser automation task using browser-use."""
         timeout = self.get_timeout(agent_config, 300)
         flash_mode = _get_config_value(agent_config, "flash_mode", "FLASH_MODE", default=True)
-        browser_id = _get_config_value(agent_config, "browser_id", "BROWSER_ID", default="Chrome-Local")
+        browser_id = _get_config_value(
+            agent_config, "browser_id", "BROWSER_ID", default="Chrome-Local"
+        )
 
         with open_browser_session(
             browser_id=browser_id,
@@ -710,10 +1165,14 @@ class BrowserUseAgent(BaseAgent):
         # Read parameters from configuration dictionary
         model_type: str = _get_config_value(agent_config, "model_type", "MODEL_TYPE", default="")
         model_id: str = _get_config_value(agent_config, "model_id", "MODEL_ID", default="")
-        browser_id = _get_config_value(agent_config, "browser_id", "BROWSER_ID", default="Chrome-Local")
+        browser_id = _get_config_value(
+            agent_config, "browser_id", "BROWSER_ID", default="Chrome-Local"
+        )
         use_vision = _get_config_value(agent_config, "use_vision", "USE_VISION", default=False)
         max_steps = self.get_max_steps(agent_config, 40)
-        save_api_logs = _get_config_value(agent_config, "save_api_logs", "SAVE_API_LOGS", default=True)
+        save_api_logs = _get_config_value(
+            agent_config, "save_api_logs", "SAVE_API_LOGS", default=True
+        )
 
         config_info = {
             "timeout_seconds": timeout,
@@ -728,6 +1187,7 @@ class BrowserUseAgent(BaseAgent):
         llm = self._create_llm(model_type, model_id, agent_config, config_info)
         llm_recorder = _LLMFailureRecorder()
         _capture_llm_failures(llm, llm_recorder)
+        _install_browser_use_diagnostics()
 
         # Initialize Browser
         agent = None
@@ -829,7 +1289,9 @@ class BrowserUseAgent(BaseAgent):
                                 action_results=hist_item.result,
                                 state=hist_item.state,
                                 state_message=getattr(hist_item, "state_message", None),
-                                llm_failures=_match_step_llm_failures(pending_llm_failures, hist_item),
+                                llm_failures=_match_step_llm_failures(
+                                    pending_llm_failures, hist_item
+                                ),
                             )
                         api_logger.log_unmatched_llm_failures(pending_llm_failures)
                         api_logger.finalize(usage_data)
@@ -919,7 +1381,9 @@ class BrowserUseAgent(BaseAgent):
     ) -> Any:
         # TODO Why not Claude?
         """Create LLM instance based on model type."""
-        provider_builders: dict[str, Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any]]] = {
+        provider_builders: dict[
+            str, Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any]]
+        ] = {
             "BROWSER_USE": self._build_browser_use_kwargs,
             "OPENAI": self._build_openai_kwargs,
             "AZURE": self._build_azure_kwargs,
@@ -1107,7 +1571,11 @@ class BrowserUseAgent(BaseAgent):
         config_info: dict[str, Any],
     ) -> dict[str, Any]:
         google_config: dict[str, Any] = {}
-        gemini_thinking_models = {"gemini-3-flash-preview", "gemini-3-pro-preview", "gemini-3.1-pro-preview"}
+        gemini_thinking_models = {
+            "gemini-3-flash-preview",
+            "gemini-3-pro-preview",
+            "gemini-3.1-pro-preview",
+        }
 
         if model_id in gemini_thinking_models:
             thinking_level = agent_config.get("gemini3_thinking_level")
